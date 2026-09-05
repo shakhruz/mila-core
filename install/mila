@@ -1,0 +1,267 @@
+#!/bin/bash
+# mila — start a Claude Code session with the mila-telegram plugin.
+# The full launch flag is too long to type by hand:
+#   claude --dangerously-load-development-channels plugin:mila-telegram@mila
+# This wrapper also makes sure the channel is alive before the session starts.
+#
+# The marketplace name comes from the plugin repository's own manifest, so a
+# client installing from GitHub gets "@mila". A local development marketplace
+# is named whatever its directory says — set MILA_PLUGIN_REF for that case
+# instead of editing this file, which is how the two names drifted apart and
+# left the launcher pointing at a marketplace no client would ever have.
+
+set -u
+
+# Find the marketplace the plugin actually sits in, rather than assuming.
+# Installing from GitHub gives "mila"; a local development marketplace gives
+# its own name. The manifest is the authority, the directory name the fallback.
+detect_plugin_ref() {
+  local dir mk name
+  dir="$(ls -d "$HOME"/.claude/plugins/*/mila-telegram 2>/dev/null | head -1)"
+  [ -z "$dir" ] && { echo "plugin:mila-telegram@mila"; return; }
+  mk="$(dirname "$dir")"
+  name="$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['name'])" \
+          "$mk/.claude-plugin/marketplace.json" 2>/dev/null || true)"
+  [ -z "$name" ] && name="$(basename "$mk")"
+  echo "plugin:mila-telegram@$name"
+}
+PLUGIN="${MILA_PLUGIN_REF:-$(detect_plugin_ref)}"
+FLAG="--dangerously-load-development-channels"
+STATE="${TELEGRAM_STATE_DIR:-$HOME/.claude/channels/telegram}"
+DAEMON_UNIT="com.milagpt.telegram-receiver"
+SENDER_UNIT="com.milagpt.telegram-sender"
+
+c_ok=$'\033[32m'; c_bad=$'\033[31m'; c_dim=$'\033[2m'; c_off=$'\033[0m'
+
+# The channel must be up BEFORE the session starts: while no session is running,
+# the daemon keeps collecting inbound messages into the journal, so none are lost.
+ensure_daemon() {
+  if ! pgrep -f "receiver.ts" >/dev/null 2>&1; then
+    echo "${c_dim}receiver is down — starting it${c_off}"
+    launchctl kickstart -k "gui/$(id -u)/$DAEMON_UNIT" 2>/dev/null \
+      || launchctl load "$HOME/Library/LaunchAgents/$DAEMON_UNIT.plist" 2>/dev/null
+    sleep 2
+  fi
+  pgrep -f "sender-daemon" >/dev/null 2>&1 || \
+    launchctl kickstart -k "gui/$(id -u)/$SENDER_UNIT" 2>/dev/null
+}
+
+status() {
+  local cur sz behind q
+  cur=$(cat "$STATE/inbound/cursor" 2>/dev/null || echo 0)
+  # `wc -c < missing` печатает ошибку самим шеллом, мимо 2>/dev/null, а статус
+  # берётся у `tr`, поэтому `||` не срабатывает и sz остаётся пустой. На чистой
+  # машине это давало ошибку на экране и зелёное «replayed ( B)» — первое, что
+  # видит клиент, выглядело одновременно как поломка и как успех.
+  if [ -f "$STATE/inbound/events.jsonl" ]; then
+    sz=$(wc -c < "$STATE/inbound/events.jsonl" | tr -d ' ')
+  else
+    sz=""
+  fi
+  echo "── mila-telegram channel ──"
+  if pgrep -f "receiver.ts" >/dev/null 2>&1; then
+    echo "  receiver   ${c_ok}up${c_off}     $(pgrep -f receiver.ts | head -1)"
+  else
+    echo "  receiver   ${c_bad}DOWN${c_off}   inbound messages are being lost"
+  fi
+  if pgrep -f "sender-daemon" >/dev/null 2>&1; then
+    echo "  sender     ${c_ok}up${c_off}"
+  else
+    echo "  sender     ${c_bad}DOWN${c_off}   replies are piling up in the outbox"
+  fi
+  if pgrep -f "bun server.ts" >/dev/null 2>&1; then
+    echo "  bridge     ${c_ok}up${c_off}"
+  else
+    echo "  bridge     ${c_dim}no session${c_off}"
+  fi
+  if [ -z "$sz" ]; then
+    echo "  journal    ${c_dim}empty${c_off}  the bot has not received anything yet"
+    q=$(ls "$STATE/outbox" 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$q" != "0" ]; then echo "  outbox     ${c_bad}${q} pending${c_off}"; else echo "  outbox     ${c_ok}empty${c_off}"; fi
+    return 0
+  fi
+  behind=$(( sz - cur ))
+  if [ "$behind" -le 0 ]; then
+    echo "  journal    ${c_ok}replayed${c_off} (${sz} B)"
+  else
+    echo "  journal    ${c_bad}${behind} B not replayed${c_off} (cursor ${cur} / ${sz})"
+  fi
+  q=$(ls "$STATE/outbox" 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$q" != "0" ]; then echo "  outbox     ${c_bad}${q} pending${c_off}"; else echo "  outbox     ${c_ok}empty${c_off}"; fi
+}
+
+
+# Send without the MCP bridge.
+#
+# The bridge lives inside the session: while the session is busy or restarting,
+# it delivers nothing, and the assistant goes mute mid-conversation. Measured on
+# this machine over two days: 646 minutes with messages arriving and none
+# delivered. Inbound survives that — the daemon keeps writing the journal and
+# the hook reads it directly — so the only thing actually broken is the ability
+# to answer.
+#
+# The sender daemon already watches a directory and does not care about the
+# session at all. Writing a file there is the escape hatch: bridge down is then
+# a loss of live notifications, not a loss of speech.
+#
+#   mila say <chat_id> "text"
+#   mila say <chat_id> "caption" --file /abs/path.png --reply-to 123
+say_out() {
+  local chat="${1:-}" text="${2:-}"; shift 2 2>/dev/null || true
+  if [ -z "$chat" ] || [ -z "$text" ]; then
+    echo "usage: mila say <chat_id> \"text\" [--file PATH] [--reply-to ID]" >&2
+    return 2
+  fi
+  local file="" reply=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --file)     file="${2:-}"; shift 2 ;;
+      --reply-to) reply="${2:-}"; shift 2 ;;
+      *) echo "unknown option: $1" >&2; return 2 ;;
+    esac
+  done
+  if ! pgrep -f "sender-daemon" >/dev/null 2>&1; then
+    echo "${c_bad}sender daemon is down — the message would sit in the queue${c_off}" >&2
+    echo "start it:  launchctl kickstart -k gui/\$(id -u)/$SENDER_UNIT" >&2
+  fi
+  CHAT="$chat" TEXT="$text" FILE="$file" REPLY="$reply" OUT="$STATE/outbox" python3 - <<'PY'
+import json, os, time
+out = os.environ["OUT"]
+os.makedirs(out, mode=0o700, exist_ok=True)
+job = {"chat_id": int(os.environ["CHAT"]), "text": os.environ["TEXT"]}
+if os.environ.get("FILE"):
+    job["file"] = os.path.abspath(os.environ["FILE"])
+if os.environ.get("REPLY"):
+    job["reply_to"] = int(os.environ["REPLY"])
+name = "mila-%d-%d.json" % (int(time.time() * 1000), os.getpid())
+tmp = os.path.join(out, name + ".tmp")
+# Пишем во временный файл и переименовываем: отправитель сканирует каталог
+# каждые две секунды и может подхватить недописанный файл.
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(job, f, ensure_ascii=False)
+os.chmod(tmp, 0o600)
+os.replace(tmp, os.path.join(out, name))
+print("queued: %s" % name)
+PY
+}
+
+
+# Unread inbound messages: what the bridge replayed but the terminal did not show.
+inbox() {
+  local ev="$STATE/inbound/events.jsonl" seen_f="$STATE/inbound/seen" limit="${1:-20}"
+  python3 - "$ev" "$seen_f" "$limit" <<'PY'
+import json, os, sys
+ev, seen_f, limit = sys.argv[1], sys.argv[2], int(sys.argv[3])
+try: seen = int(open(seen_f).read().strip() or 0)
+except Exception: seen = 0
+# На свежей машине журнала ещё нет, и это норма, а не сбой. Трейсбек здесь
+# читается клиентом как «сломалось при первом запуске».
+if not os.path.exists(ev):
+    print("journal is empty — the bot has not received anything yet")
+    raise SystemExit(0)
+size = os.path.getsize(ev)
+rows = []
+with open(ev, "rb") as f:
+    f.seek(seen)
+    offset = seen
+    for line in f:
+        start, offset = offset, offset + len(line)
+        try:
+            e = json.loads(line); m = e.get("params", {}).get("meta", {}) or {}
+        except Exception: continue
+        u = m.get("user") or ""
+        # Только болтовню ботов отбрасываем. Человек без @username — обычное
+        # дело у наших клиентов, а раньше он просто не появлялся в списке:
+        # хук его показывал как id:…, а эта команда молча выбрасывала.
+        if u.endswith("_bot"): continue
+        who = u or f"id:{m.get('user_id', '?')}"
+        txt = (e["params"].get("content") or "").replace("\n", " ")[:110]
+        att = " [file]" if m.get("image_path") or m.get("attachment_file_id") else ""
+        rows.append((offset, f"  {m.get('chat_id')}/{m.get('message_id')}  {who}{att}: {txt}"))
+if not rows:
+    print("no unread messages")
+    open(seen_f, "w").write(str(size))
+else:
+    shown = rows[:limit]
+    print(f"── {len(rows)} unread ──")
+    for _o, r in shown: print(r)
+    if len(rows) > limit:
+        print(f"  … {len(rows)-limit} more, run: mila inbox {len(rows)}")
+    # Прочитанным помечается ровно показанное. Раньше маркер прыгал на конец
+    # файла, и всё, что не влезло в limit, исчезало — включая подсказку выше,
+    # которая после этого гарантированно отвечала «no unread messages».
+    open(seen_f, "w").write(str(size if len(shown) == len(rows) else shown[-1][0]))
+print("(marked as seen)")
+PY
+}
+
+case "${1:-continue}" in
+  status|st)   status ;;
+  inbox|in)    shift; inbox "${1:-20}" ;;
+  say)         shift; say_out "$@" ;;
+  usage|u)     shift
+               # Собиратель лежит рядом со скиллом; если кит поставлен
+               # установщиком, он в hooks/ рядом с хуком входящих.
+               for c in "$HOME/.claude/hooks/usage_collect.py" \
+                        "$HOME/.claude/skills/mila-session/usage_collect.py" \
+                        "$(dirname "$0")/usage_collect.py"; do
+                 [ -f "$c" ] && exec python3 "$c" "$@"
+               done
+               echo "usage_collect.py not found — reinstall the kit" >&2; exit 1 ;;
+  chats|c)     shift
+               for c in "$HOME/.claude/hooks/chats_index.py" \
+                        "$HOME/.claude/skills/mila-session/chats_index.py" \
+                        "$(dirname "$0")/chats_index.py"; do
+                 [ -f "$c" ] && exec python3 "$c" "$@"
+               done
+               echo "chats_index.py not found — reinstall the kit" >&2; exit 1 ;;
+  owe|note)    shift
+               for c in "$HOME/.claude/hooks/chat_note.py" \
+                        "$(dirname "$0")/chat_note.py"; do
+                 [ -f "$c" ] && exec python3 "$c" "$@"
+               done
+               echo "chat_note.py not found — reinstall the kit" >&2; exit 1 ;;
+  doctor|doc)  shift
+               for c in "$HOME/.claude/hooks/doctor.py" \
+                        "$(dirname "$0")/doctor.py"; do
+                 [ -f "$c" ] && exec python3 "$c" "$@"
+               done
+               echo "doctor.py not found — reinstall the kit" >&2; exit 1 ;;
+  when|tz)     shift
+               for c in "$HOME/.claude/hooks/chat_locale.py" \
+                        "$(dirname "$0")/chat_locale.py"; do
+                 [ -f "$c" ] && exec python3 "$c" "$@"
+               done
+               echo "chat_locale.py not found — reinstall the kit" >&2; exit 1 ;;
+  backup|bak)  shift
+               for c in "$HOME/.claude/hooks/backup.py" \
+                        "$(dirname "$0")/backup.py"; do
+                 [ -f "$c" ] && exec python3 "$c" "$@"
+               done
+               echo "backup.py not found — reinstall the kit" >&2; exit 1 ;;
+  fix)         launchctl kickstart -k "gui/$(id -u)/$DAEMON_UNIT" 2>/dev/null
+               launchctl kickstart -k "gui/$(id -u)/$SENDER_UNIT" 2>/dev/null
+               sleep 2; status ;;
+  new|n)       ensure_daemon; shift; exec claude $FLAG "$PLUGIN" "$@" ;;
+  pick|p)      ensure_daemon; shift; exec claude $FLAG "$PLUGIN" --resume "$@" ;;
+  help|-h|--help)
+               cat <<'HELP'
+mila            resume the last session with the plugin (--continue)
+mila new        start a fresh session
+mila pick       choose a session from the list (--resume)
+mila status     channel health: receiver, sender, bridge, journal, outbox
+mila doctor     full diagnosis: token, privacy mode, access, daemon, permissions
+mila inbox      show unread inbound messages and mark them seen
+mila fix        restart receiver and sender (leaves the session alone)
+mila usage      token spend by day and model (--days 7 --by-model)
+mila chats      rebuild the chat registry (--stale 14 lists quiet ones)
+mila owe        every open promise across all chats
+mila when       what time it is for each client, and who is in quiet hours
+mila backup     status | run | list — archive what cannot be recovered
+mila note <id>  write to a chat card (--purpose --member --promise --done --note)
+
+Anything after the command is passed to claude as-is:  mila new --model opus
+HELP
+               ;;
+  *)           ensure_daemon; exec claude $FLAG "$PLUGIN" --continue "$@" ;;
+esac
